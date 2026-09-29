@@ -23,13 +23,14 @@ distort its weights once price is included in a real feed.
 
 The semantic duplicate fingerprint is `(tx_hash, block_time, wallet, side, amount)`.
 It excludes `event_id` and `ingested_at`, which commonly change during replay, and
-does not assume that `tx_hash` alone is unique: one blockchain transaction can
-contain multiple trades. This fingerprint is a heuristic: distinct trades with
-identical fields could be conflated. For EVM-like on-chain trade logs, a production
-schema should include `chain_id` and `log_index`; `(chain_id, tx_hash, log_index)`
-can identify the source log more reliably. The Ethereum execution API exposes
-[`transactionHash` and `logIndex` in log records](https://ethereum.github.io/execution-apis/api/methods/eth_getLogs/).
-Other chains and off-chain trades need their own authoritative event identity.
+does not assume that `tx_hash` alone is unique. For EVM-like on-chain feeds, one
+transaction can emit multiple trade logs: the Ethereum execution API returns
+[an array of logs per transaction](https://ethereum.github.io/execution-apis/api/methods/eth_getTransactionReceipt/),
+each with a `transactionHash` and `logIndex`. A production schema for such a feed
+should include `chain_id` and `log_index` to identify the source log more reliably.
+The current fingerprint remains a heuristic: distinct trades with identical fields
+could be conflated. Other chains and off-chain trades need their own authoritative
+event identity.
 
 ## Why `evt_005` goes to a dead-letter queue
 
@@ -73,6 +74,8 @@ per load and read every artifact from that directory; a failed run leaves the pr
 generation selected. Individual files and the pointer are replaced with
 `os.Rename`. On Unix, a same-filesystem rename gives atomic visibility, but
 [Go does not guarantee atomicity on every platform](https://pkg.go.dev/os#Rename).
+Previous generations are retained so in-flight readers can finish; production
+deployments should delete them only under an explicit retention policy.
 
 ## Run the pipeline
 
