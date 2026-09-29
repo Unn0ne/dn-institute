@@ -5,6 +5,7 @@ import (
 	"encoding/csv"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math/big"
 	"os"
@@ -86,7 +87,15 @@ func TestPipelineWritesAnalyticsDeadLetterAndJSONReport(t *testing.T) {
 		t.Fatalf("runPipeline() error = %v", err)
 	}
 
-	validRows := readCSVFile(t, filepath.Join(outputDirectory, validOutputName))
+	latest, err := os.ReadFile(filepath.Join(outputDirectory, latestOutputName))
+	if err != nil {
+		t.Fatalf("read latest output pointer: %v", err)
+	}
+	if got := filepath.Join(outputDirectory, strings.TrimSpace(string(latest))); got != result.RunDir {
+		t.Fatalf("latest output directory = %q, want %q", got, result.RunDir)
+	}
+
+	validRows := readCSVFile(t, filepath.Join(result.RunDir, validOutputName))
 	if len(validRows) != 5 {
 		t.Fatalf("valid CSV records including header = %d, want 5", len(validRows))
 	}
@@ -96,7 +105,7 @@ func TestPipelineWritesAnalyticsDeadLetterAndJSONReport(t *testing.T) {
 		t.Fatalf("valid output IDs = %v, want %v", gotValidIDs, wantValidIDs)
 	}
 
-	rejectedRows := readCSVFile(t, filepath.Join(outputDirectory, rejectedOutputName))
+	rejectedRows := readCSVFile(t, filepath.Join(result.RunDir, rejectedOutputName))
 	if len(rejectedRows) != 5 {
 		t.Fatalf("rejected CSV records including header = %d, want 5", len(rejectedRows))
 	}
@@ -104,7 +113,7 @@ func TestPipelineWritesAnalyticsDeadLetterAndJSONReport(t *testing.T) {
 		t.Fatalf("first rejection code = %q, want %s", rejectedRows[1][len(csvFields)+1], DuplicateTrade)
 	}
 
-	reportFile, err := os.Open(filepath.Join(outputDirectory, reportOutputName))
+	reportFile, err := os.Open(filepath.Join(result.RunDir, reportOutputName))
 	if err != nil {
 		t.Fatalf("open report: %v", err)
 	}
@@ -143,16 +152,82 @@ func TestPipelineErrorPaths(t *testing.T) {
 		}
 	})
 
-	t.Run("output artifact cannot be replaced", func(t *testing.T) {
+	t.Run("latest pointer cannot be replaced", func(t *testing.T) {
 		outputDirectory := t.TempDir()
-		if err := os.Mkdir(filepath.Join(outputDirectory, validOutputName), 0o755); err != nil {
-			t.Fatalf("create conflicting output directory: %v", err)
+		if err := os.Mkdir(filepath.Join(outputDirectory, latestOutputName), 0o755); err != nil {
+			t.Fatalf("create conflicting latest directory: %v", err)
 		}
 		_, err := runPipeline("sample_feed.csv", outputDirectory)
-		if err == nil || !strings.Contains(err.Error(), "write "+validOutputName) {
-			t.Fatalf("error = %v, want valid output write error", err)
+		if err == nil || !strings.Contains(err.Error(), "publish output run") {
+			t.Fatalf("error = %v, want pointer publication error", err)
+		}
+		runs, err := os.ReadDir(filepath.Join(outputDirectory, "runs"))
+		if err != nil || len(runs) != 0 {
+			t.Fatalf("run directories = %v, error = %v; want none", runs, err)
 		}
 	})
+}
+
+func TestPipelinePublishesCompleteGenerations(t *testing.T) {
+	outputDirectory := t.TempDir()
+	first, err := runPipeline("sample_feed.csv", outputDirectory)
+	if err != nil {
+		t.Fatalf("first run: %v", err)
+	}
+	firstPointer, err := os.ReadFile(filepath.Join(outputDirectory, latestOutputName))
+	if err != nil {
+		t.Fatalf("read first pointer: %v", err)
+	}
+
+	wanted := errors.New("injected second artifact failure")
+	_, err = publishOutputs(outputDirectory, []outputFile{
+		{validOutputName, func(writer io.Writer) error {
+			_, err := io.WriteString(writer, "new")
+			return err
+		}},
+		{rejectedOutputName, func(io.Writer) error { return wanted }},
+		{reportOutputName, func(writer io.Writer) error {
+			_, err := io.WriteString(writer, "new")
+			return err
+		}},
+	})
+	if !errors.Is(err, wanted) {
+		t.Fatalf("publish failed run error = %v, want %v", err, wanted)
+	}
+	currentPointer, err := os.ReadFile(filepath.Join(outputDirectory, latestOutputName))
+	if err != nil {
+		t.Fatalf("read pointer after failed run: %v", err)
+	}
+	if !bytes.Equal(currentPointer, firstPointer) {
+		t.Fatalf("pointer changed after failed run: %q to %q", firstPointer, currentPointer)
+	}
+	if got := readCSVFile(t, filepath.Join(first.RunDir, validOutputName)); len(got) != 5 {
+		t.Fatalf("first generation valid records = %d, want 5", len(got))
+	}
+	runs, err := os.ReadDir(filepath.Join(outputDirectory, "runs"))
+	if err != nil || len(runs) != 1 {
+		t.Fatalf("run directories after failure = %v, error = %v; want one", runs, err)
+	}
+
+	second, err := runPipeline("sample_feed.csv", outputDirectory)
+	if err != nil {
+		t.Fatalf("second run: %v", err)
+	}
+	if second.RunDir == first.RunDir {
+		t.Fatal("successful runs shared an output directory")
+	}
+	currentPointer, err = os.ReadFile(filepath.Join(outputDirectory, latestOutputName))
+	if err != nil {
+		t.Fatalf("read second pointer: %v", err)
+	}
+	if got := filepath.Join(outputDirectory, strings.TrimSpace(string(currentPointer))); got != second.RunDir {
+		t.Fatalf("second pointer = %q, want %q", got, second.RunDir)
+	}
+	for _, name := range []string{validOutputName, rejectedOutputName, reportOutputName} {
+		if _, err := os.Stat(filepath.Join(second.RunDir, name)); err != nil {
+			t.Fatalf("second generation missing %s: %v", name, err)
+		}
+	}
 }
 
 func TestOutputWritersPropagateErrors(t *testing.T) {
@@ -321,6 +396,51 @@ func TestInvalidFirstOccurrenceDoesNotSuppressValidReplay(t *testing.T) {
 	assertOnlyIssue(t, result.Rejected[0], IngestionBeforeBlockTime)
 }
 
+func TestInvalidFirstOccurrenceDoesNotReserveEventID(t *testing.T) {
+	invalid := validRow("evt_same")
+	invalid["amount"] = "-1"
+	valid := validRow("evt_same")
+
+	result := validateRows([]map[string]string{invalid, valid}, 2)
+	if got := eventIDs(result.Accepted); !reflect.DeepEqual(got, []string{"evt_same"}) {
+		t.Fatalf("accepted events = %v, want evt_same", got)
+	}
+	assertOnlyIssue(t, result.Rejected[0], InvalidAmount)
+}
+
+func TestSemanticDuplicateDoesNotReserveEventID(t *testing.T) {
+	first := validRow("evt_original")
+	replay := validRow("evt_reused")
+	replay["ingested_at"] = "10:00:02"
+	different := validRow("evt_reused")
+	different["tx_hash"] = "0x2"
+	different["block_time"] = "10:01:00"
+	different["ingested_at"] = "10:01:01"
+
+	result := validateRows([]map[string]string{first, replay, different}, 2)
+	if got := eventIDs(result.Accepted); !reflect.DeepEqual(got, []string{"evt_original", "evt_reused"}) {
+		t.Fatalf("accepted events = %v, want original and reused IDs", got)
+	}
+	assertOnlyIssue(t, result.Rejected[0], DuplicateTrade)
+}
+
+func TestNullEventIDsAreMissingNotDuplicate(t *testing.T) {
+	first := validRow("null")
+	second := validRow("NULL")
+	second["tx_hash"] = "0x2"
+	result := validateRows([]map[string]string{first, second}, 2)
+	if len(result.Accepted) != 0 || len(result.Rejected) != 2 {
+		t.Fatalf("accepted/rejected = %d/%d, want 0/2", len(result.Accepted), len(result.Rejected))
+	}
+	for index, rejected := range result.Rejected {
+		assertOnlyIssue(t, rejected, MissingRequiredField)
+		wantID := fmt.Sprintf("<row %d>", index+2)
+		if rejected.EventID != wantID || rejected.Issues[0].EventID != wantID {
+			t.Fatalf("rejected event/issue IDs = %q/%q, want %q", rejected.EventID, rejected.Issues[0].EventID, wantID)
+		}
+	}
+}
+
 func TestDuplicateEventIDIsRejectedEvenWhenTradeDiffers(t *testing.T) {
 	first := validRow("evt_same")
 	second := validRow("evt_same")
@@ -389,6 +509,83 @@ func TestTimestampFormats(t *testing.T) {
 	}
 }
 
+func TestMixedTimestampFormatsWithinRowAreRejected(t *testing.T) {
+	for _, test := range []struct {
+		name      string
+		blockTime string
+		ingested  string
+	}{
+		{"time-only block", "10:00:00", "2026-09-28T10:00:01Z"},
+		{"RFC3339 block", "2026-09-28T10:00:00Z", "10:00:01"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			row := validRow("evt_mixed")
+			row["block_time"] = test.blockTime
+			row["ingested_at"] = test.ingested
+			result := validateRows([]map[string]string{row}, 2)
+			if len(result.Accepted) != 0 || len(result.Rejected) != 1 {
+				t.Fatalf("accepted/rejected = %d/%d, want 0/1", len(result.Accepted), len(result.Rejected))
+			}
+			assertOnlyIssue(t, result.Rejected[0], MixedTimestampFormat)
+		})
+	}
+}
+
+func TestMixedTimestampFormatsAcrossAcceptedFeedAreRejected(t *testing.T) {
+	for _, firstRFC3339 := range []bool{false, true} {
+		name := "time-only first"
+		if firstRFC3339 {
+			name = "RFC3339 first"
+		}
+		t.Run(name, func(t *testing.T) {
+			first := validRow("evt_first")
+			second := validRow("evt_second")
+			second["tx_hash"] = "0x2"
+			second["block_time"] = "11:00:00"
+			second["ingested_at"] = "11:00:01"
+			if firstRFC3339 {
+				first["block_time"] = "2026-09-28T10:00:00Z"
+				first["ingested_at"] = "2026-09-28T10:00:01Z"
+			} else {
+				second["block_time"] = "2026-09-28T11:00:00Z"
+				second["ingested_at"] = "2026-09-28T11:00:01Z"
+			}
+			result := validateRows([]map[string]string{first, second}, 2)
+			if got := eventIDs(result.Accepted); !reflect.DeepEqual(got, []string{"evt_first"}) {
+				t.Fatalf("accepted events = %v, want only evt_first", got)
+			}
+			assertOnlyIssue(t, result.Rejected[0], MixedTimestampFormat)
+		})
+	}
+}
+
+func TestRFC3339FeedIsAccepted(t *testing.T) {
+	first := validRow("evt_first")
+	first["block_time"] = "2026-09-28T10:00:00Z"
+	first["ingested_at"] = "2026-09-28T10:00:01Z"
+	second := validRow("evt_second")
+	second["tx_hash"] = "0x2"
+	second["block_time"] = "2026-09-28T11:00:00Z"
+	second["ingested_at"] = "2026-09-28T11:00:01Z"
+	result := validateRows([]map[string]string{first, second}, 2)
+	if len(result.Accepted) != 2 || len(result.Rejected) != 0 {
+		t.Fatalf("accepted/rejected = %d/%d, want 2/0", len(result.Accepted), len(result.Rejected))
+	}
+}
+
+func TestRejectedRowDoesNotSetTimestampFormatForFeed(t *testing.T) {
+	invalid := validRow("evt_invalid")
+	invalid["amount"] = "-1"
+	valid := validRow("evt_valid")
+	valid["block_time"] = "2026-09-28T10:00:00Z"
+	valid["ingested_at"] = "2026-09-28T10:00:01Z"
+	result := validateRows([]map[string]string{invalid, valid}, 2)
+	if got := eventIDs(result.Accepted); !reflect.DeepEqual(got, []string{"evt_valid"}) {
+		t.Fatalf("accepted events = %v, want only evt_valid", got)
+	}
+	assertOnlyIssue(t, result.Rejected[0], InvalidAmount)
+}
+
 func TestCSVSchemaAndSyntaxFailures(t *testing.T) {
 	tests := []struct {
 		name    string
@@ -399,6 +596,7 @@ func TestCSVSchemaAndSyntaxFailures(t *testing.T) {
 		{name: "missing columns", content: "event_id,tx_hash\nevt_1,0x1\n", want: "missing required CSV column"},
 		{name: "duplicate column", content: "event_id,event_id\na,b\n", want: "duplicate CSV column"},
 		{name: "empty column", content: "event_id,\na,b\n", want: "header column 2 is empty"},
+		{name: "reserved column", content: "event_id,tx_hash,block_time,wallet,side,amount,ingested_at,validation_codes\n", want: "reserved output column"},
 		{name: "invalid CSV", content: "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n\"unterminated", want: "read CSV record"},
 	}
 
@@ -414,13 +612,58 @@ func TestCSVSchemaAndSyntaxFailures(t *testing.T) {
 
 func TestCSVSupportsBOMReorderedColumnsAndExtraColumns(t *testing.T) {
 	feed := "\uFEFFamount,side,wallet,block_time,tx_hash,event_id,ingested_at,venue\n" +
-		"1,BUY,0xwallet,10:00:00,0x1,evt_1,10:00:01,exchange\n"
+		"1,BUY,0xwallet,10:00:00,0x1,evt_1,10:00:01,exchange\n" +
+		"-1,SELL,0xwallet,10:01:00,0x2,evt_2,10:01:01,other venue\n"
 	result, err := validateCSV(strings.NewReader(feed))
 	if err != nil {
 		t.Fatalf("validateCSV() error = %v", err)
 	}
-	if len(result.Accepted) != 1 || len(result.Rejected) != 0 {
-		t.Fatalf("accepted/rejected = %d/%d, want 1/0", len(result.Accepted), len(result.Rejected))
+	if len(result.Accepted) != 1 || len(result.Rejected) != 1 {
+		t.Fatalf("accepted/rejected = %d/%d, want 1/1", len(result.Accepted), len(result.Rejected))
+	}
+	wantHeader := []string{"amount", "side", "wallet", "block_time", "tx_hash", "event_id", "ingested_at", "venue"}
+	if !reflect.DeepEqual(result.Columns, wantHeader) {
+		t.Fatalf("columns = %v, want %v", result.Columns, wantHeader)
+	}
+	if result.Accepted[0].Raw["venue"] != "exchange" || result.Rejected[0].Raw["venue"] != "other venue" {
+		t.Fatalf("extra column values lost: accepted = %q, rejected = %q", result.Accepted[0].Raw["venue"], result.Rejected[0].Raw["venue"])
+	}
+	var valid, rejected bytes.Buffer
+	if err := writeValidEvents(&valid, result); err != nil {
+		t.Fatalf("write valid events: %v", err)
+	}
+	if err := writeRejectedEvents(&rejected, result); err != nil {
+		t.Fatalf("write rejected events: %v", err)
+	}
+	validRows, err := csv.NewReader(&valid).ReadAll()
+	if err != nil {
+		t.Fatalf("read valid output: %v", err)
+	}
+	rejectedRows, err := csv.NewReader(&rejected).ReadAll()
+	if err != nil {
+		t.Fatalf("read rejected output: %v", err)
+	}
+	if !reflect.DeepEqual(validRows[0], wantHeader) || validRows[1][7] != "exchange" {
+		t.Fatalf("valid output = %v, want original header and venue", validRows)
+	}
+	if !reflect.DeepEqual(rejectedRows[0][:len(wantHeader)], wantHeader) || rejectedRows[1][7] != "other venue" {
+		t.Fatalf("rejected output = %v, want original header and venue", rejectedRows)
+	}
+}
+
+func TestRejectedRowPreservesInputValues(t *testing.T) {
+	feed := "event_id,tx_hash,block_time,wallet,side,amount,ingested_at,venue\n" +
+		"evt_1,0x1,, 0xwallet ,BUY,-1,10:00:01, primary market \n"
+	result, err := validateCSV(strings.NewReader(feed))
+	if err != nil {
+		t.Fatalf("validate CSV: %v", err)
+	}
+	if len(result.Rejected) != 1 {
+		t.Fatalf("rejected rows = %d, want 1", len(result.Rejected))
+	}
+	if result.Rejected[0].Raw["wallet"] != " 0xwallet " ||
+		result.Rejected[0].Raw["venue"] != " primary market " {
+		t.Fatalf("rejected row = %v, want original field values", result.Rejected[0].Raw)
 	}
 }
 

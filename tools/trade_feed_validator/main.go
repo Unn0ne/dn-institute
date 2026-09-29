@@ -46,7 +46,7 @@ func runCLI(args []string, stdout, stderr io.Writer) int {
 	for _, code := range sortedIssueCodes(counts) {
 		lines = append(lines, fmt.Sprintf("  %s: %d", code, counts[code]))
 	}
-	lines = append(lines, fmt.Sprintf("Outputs: %s", *outputDir))
+	lines = append(lines, fmt.Sprintf("Outputs: %s", result.RunDir))
 	if _, err := io.WriteString(stdout, strings.Join(lines, "\n")+"\n"); err != nil {
 		_, _ = io.WriteString(stderr, fmt.Sprintf("error: write command output: %v\n", err))
 		return 2

@@ -37,6 +37,7 @@ const (
 	IngestionBeforeBlockTime IssueCode = "INGESTION_BEFORE_BLOCK_TIME"
 	DuplicateEventID         IssueCode = "DUPLICATE_EVENT_ID"
 	DuplicateTrade           IssueCode = "DUPLICATE_TRADE"
+	MixedTimestampFormat     IssueCode = "MIXED_TIMESTAMP_FORMAT"
 	MalformedRow             IssueCode = "MALFORMED_ROW"
 )
 
@@ -69,8 +70,10 @@ type RejectedEvent struct {
 
 type ValidationResult struct {
 	InputRows int
+	Columns   []string
 	Accepted  []TradeEvent
 	Rejected  []RejectedEvent
+	RunDir    string
 }
 
 func (r ValidationResult) Issues() []ValidationIssue {
@@ -115,6 +118,14 @@ type tradeOrigin struct {
 	sourceRow int
 }
 
+type timestampFormat uint8
+
+const (
+	unknownFormat timestampFormat = iota
+	timeOnlyFormat
+	rfc3339Format
+)
+
 func validateCSV(reader io.Reader) (ValidationResult, error) {
 	csvReader := csv.NewReader(reader)
 	csvReader.FieldsPerRecord = -1
@@ -136,6 +147,10 @@ func validateCSV(reader io.Reader) (ValidationResult, error) {
 		if _, exists := headerIndex[name]; exists {
 			return ValidationResult{}, fmt.Errorf("feed schema: duplicate CSV column %q", name)
 		}
+		if name == "source_row" || name == "validation_codes" || name == "validation_messages" {
+			return ValidationResult{}, fmt.Errorf("feed schema: reserved output column %q", name)
+		}
+		header[index] = name
 		headerIndex[name] = index
 	}
 
@@ -166,9 +181,8 @@ func validateCSV(reader io.Reader) (ValidationResult, error) {
 			sourceRow, _ = csvReader.FieldPos(0)
 		}
 
-		values := make(map[string]string, len(csvFields))
-		for _, field := range csvFields {
-			index := headerIndex[field]
+		values := make(map[string]string, len(header))
+		for index, field := range header {
 			if index < len(record) {
 				values[field] = record[index]
 			} else {
@@ -187,7 +201,7 @@ func validateCSV(reader io.Reader) (ValidationResult, error) {
 		rows = append(rows, row)
 	}
 
-	return validateInputRows(rows), nil
+	return validateInputRows(rows, header), nil
 }
 
 func validateRows(rows []map[string]string, startRow int) ValidationResult {
@@ -198,20 +212,28 @@ func validateRows(rows []map[string]string, startRow int) ValidationResult {
 			sourceRow: startRow + index,
 		})
 	}
-	return validateInputRows(inputRows)
+	return validateInputRows(inputRows, csvFields)
 }
 
-func validateInputRows(rows []inputRow) ValidationResult {
-	result := ValidationResult{InputRows: len(rows)}
+func validateInputRows(rows []inputRow, columns []string) ValidationResult {
+	result := ValidationResult{
+		InputRows: len(rows),
+		Columns:   append([]string(nil), columns...),
+	}
 	result.Accepted = make([]TradeEvent, 0, len(rows))
 	result.Rejected = make([]RejectedEvent, 0)
 
 	seenEventIDs := make(map[string]int, len(rows))
 	seenTrades := make(map[tradeFingerprint]tradeOrigin, len(rows))
+	feedTimeFormat := unknownFormat
 
 	for _, incoming := range rows {
-		raw := normaliseRow(incoming.values)
-		eventID := raw["event_id"]
+		raw := cloneRow(incoming.values)
+		values := normaliseRow(raw)
+		eventID := values["event_id"]
+		if isMissing(eventID) {
+			eventID = ""
+		}
 		displayID := eventID
 		if displayID == "" {
 			displayID = fmt.Sprintf("<row %d>", incoming.sourceRow)
@@ -233,19 +255,19 @@ func validateInputRows(rows []inputRow) ValidationResult {
 		}
 
 		for _, field := range requiredFields {
-			if isMissing(raw[field]) {
+			if isMissing(values[field]) {
 				addIssue(MissingRequiredField, fmt.Sprintf("required field %q is missing", field), "")
 			}
 		}
 
-		if isMissing(raw["block_time"]) {
+		if isMissing(values["block_time"]) {
 			addIssue(MissingBlockTime, "block_time is required for time-based analytics", "")
 		}
 
 		var blockTime time.Time
 		blockTimeValid := false
-		if !isMissing(raw["block_time"]) {
-			parsed, parseErr := parseUTCTimestamp(raw["block_time"])
+		if !isMissing(values["block_time"]) {
+			parsed, parseErr := parseUTCTimestamp(values["block_time"])
 			if parseErr != nil {
 				addIssue(InvalidBlockTime, fmt.Sprintf("block_time is invalid: %v", parseErr), "")
 			} else {
@@ -256,8 +278,8 @@ func validateInputRows(rows []inputRow) ValidationResult {
 
 		var ingestedAt time.Time
 		ingestedAtValid := false
-		if !isMissing(raw["ingested_at"]) {
-			parsed, parseErr := parseUTCTimestamp(raw["ingested_at"])
+		if !isMissing(values["ingested_at"]) {
+			parsed, parseErr := parseUTCTimestamp(values["ingested_at"])
 			if parseErr != nil {
 				addIssue(InvalidIngestedAt, fmt.Sprintf("ingested_at is invalid: %v", parseErr), "")
 			} else {
@@ -266,11 +288,11 @@ func validateInputRows(rows []inputRow) ValidationResult {
 			}
 		}
 
-		side := strings.ToUpper(raw["side"])
+		side := strings.ToUpper(values["side"])
 		sideValid := false
-		if !isMissing(raw["side"]) {
+		if !isMissing(values["side"]) {
 			if side != "BUY" && side != "SELL" {
-				addIssue(InvalidSide, fmt.Sprintf("side must be BUY or SELL, got %q", raw["side"]), "")
+				addIssue(InvalidSide, fmt.Sprintf("side must be BUY or SELL, got %q", values["side"]), "")
 			} else {
 				sideValid = true
 			}
@@ -278,8 +300,8 @@ func validateInputRows(rows []inputRow) ValidationResult {
 
 		var amount *big.Rat
 		amountValid := false
-		if !isMissing(raw["amount"]) {
-			parsed, parseErr := parsePositiveDecimal(raw["amount"])
+		if !isMissing(values["amount"]) {
+			parsed, parseErr := parsePositiveDecimal(values["amount"])
 			if parseErr != nil {
 				addIssue(InvalidAmount, parseErr.Error(), "")
 			} else {
@@ -288,7 +310,20 @@ func validateInputRows(rows []inputRow) ValidationResult {
 			}
 		}
 
-		if blockTimeValid && ingestedAtValid && ingestedAt.Before(blockTime) {
+		comparableTimes := blockTimeValid && ingestedAtValid
+		if comparableTimes {
+			blockFormat := timestampFormatOf(values["block_time"])
+			ingestionFormat := timestampFormatOf(values["ingested_at"])
+			if blockFormat != ingestionFormat {
+				addIssue(MixedTimestampFormat, "block_time and ingested_at use different timestamp formats", "")
+				comparableTimes = false
+			} else if feedTimeFormat != unknownFormat && blockFormat != feedTimeFormat {
+				addIssue(MixedTimestampFormat, "timestamp format differs from earlier accepted rows", "")
+				comparableTimes = false
+			}
+		}
+
+		if comparableTimes && ingestedAt.Before(blockTime) {
 			addIssue(IngestionBeforeBlockTime, "ingested_at is earlier than block_time", "")
 		}
 
@@ -299,20 +334,18 @@ func validateInputRows(rows []inputRow) ValidationResult {
 					fmt.Sprintf("event_id was already seen on source row %d", firstRow),
 					eventID,
 				)
-			} else {
-				seenEventIDs[eventID] = incoming.sourceRow
 			}
 		}
 
 		var fingerprint tradeFingerprint
-		fingerprintValid := raw["tx_hash"] != "" && raw["wallet"] != "" &&
-			blockTimeValid && sideValid && amountValid
+		fingerprintValid := !isMissing(values["tx_hash"]) && !isMissing(values["wallet"]) &&
+			comparableTimes && sideValid && amountValid
 		if fingerprintValid {
 			// Replays may get a new event ID and ingestion time, so neither belongs here.
 			fingerprint = tradeFingerprint{
-				txHash:    strings.ToLower(raw["tx_hash"]),
+				txHash:    strings.ToLower(values["tx_hash"]),
 				blockTime: blockTime,
-				wallet:    strings.ToLower(raw["wallet"]),
+				wallet:    strings.ToLower(values["wallet"]),
 				side:      side,
 				amount:    amount.RatString(),
 			}
@@ -339,18 +372,21 @@ func validateInputRows(rows []inputRow) ValidationResult {
 			continue
 		}
 
-		if eventID == "" || raw["tx_hash"] == "" || raw["wallet"] == "" ||
+		if eventID == "" || isMissing(values["tx_hash"]) || isMissing(values["wallet"]) ||
 			!blockTimeValid || !ingestedAtValid || !sideValid || !amountValid || !fingerprintValid {
 			panic("validator invariant violated")
 		}
 
 		canonicalRaw := cloneRow(raw)
+		for _, field := range csvFields {
+			canonicalRaw[field] = values[field]
+		}
 		canonicalRaw["side"] = side
 		event := TradeEvent{
 			EventID:    eventID,
-			TxHash:     raw["tx_hash"],
+			TxHash:     values["tx_hash"],
 			BlockTime:  blockTime,
-			Wallet:     raw["wallet"],
+			Wallet:     values["wallet"],
 			Side:       side,
 			Amount:     *new(big.Rat).Set(amount),
 			IngestedAt: ingestedAt,
@@ -358,7 +394,11 @@ func validateInputRows(rows []inputRow) ValidationResult {
 			Raw:        canonicalRaw,
 		}
 		result.Accepted = append(result.Accepted, event)
+		seenEventIDs[eventID] = incoming.sourceRow
 		seenTrades[fingerprint] = tradeOrigin{eventID: event.EventID, sourceRow: event.SourceRow}
+		if feedTimeFormat == unknownFormat {
+			feedTimeFormat = timestampFormatOf(values["block_time"])
+		}
 	}
 
 	sort.Slice(result.Accepted, func(i, j int) bool {
@@ -394,6 +434,13 @@ func isMissing(value string) bool {
 	return value == "" || strings.EqualFold(value, "null")
 }
 
+func timestampFormatOf(value string) timestampFormat {
+	if strings.Contains(value, "T") || strings.Contains(value, "-") {
+		return rfc3339Format
+	}
+	return timeOnlyFormat
+}
+
 func parsePositiveDecimal(value string) (*big.Rat, error) {
 	if !decimalPattern.MatchString(value) {
 		return nil, fmt.Errorf("amount must be a decimal number, got %q", value)
@@ -407,7 +454,7 @@ func parsePositiveDecimal(value string) (*big.Rat, error) {
 }
 
 func parseUTCTimestamp(value string) (time.Time, error) {
-	if strings.Contains(value, "T") || strings.Contains(value, "-") {
+	if timestampFormatOf(value) == rfc3339Format {
 		parsed, err := time.Parse(time.RFC3339Nano, value)
 		if err != nil {
 			return time.Time{}, fmt.Errorf("expected an RFC3339 UTC timestamp, got %q", value)

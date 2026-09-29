@@ -24,8 +24,12 @@ distort its weights once price is included in a real feed.
 The semantic duplicate fingerprint is `(tx_hash, block_time, wallet, side, amount)`.
 It excludes `event_id` and `ingested_at`, which commonly change during replay, and
 does not assume that `tx_hash` alone is unique: one blockchain transaction can
-contain multiple trades. A production schema should include `chain_id` and
-`log_index`; `(chain_id, tx_hash, log_index)` is the safer idempotency key.
+contain multiple trades. This fingerprint is a heuristic: distinct trades with
+identical fields could be conflated. For EVM-like on-chain trade logs, a production
+schema should include `chain_id` and `log_index`; `(chain_id, tx_hash, log_index)`
+can identify the source log more reliably. The Ethereum execution API exposes
+[`transactionHash` and `logIndex` in log records](https://ethereum.github.io/execution-apis/api/methods/eth_getLogs/).
+Other chains and off-chain trades need their own authoritative event identity.
 
 ## Why `evt_005` goes to a dead-letter queue
 
@@ -45,19 +49,30 @@ The validator checks:
 - CSV schema, duplicate headers, and malformed record widths;
 - required fields and `null` values;
 - UTC event and ingestion timestamps;
+- one timestamp representation per accepted feed (time-only or RFC3339), with
+  matching representations within each row;
 - `BUY`/`SELL` side values and strictly positive decimal amounts;
 - ingestion-time causality;
 - duplicate `event_id` values and semantic trade replays.
 
 Amounts use `math/big.Rat`, not `float64`, so large or fractional decimal values are
 compared without rounding. Header order does not matter, a UTF-8 BOM is supported,
-and extra named columns are tolerated. Invalid rows may carry multiple reason codes.
+and extra named columns are preserved in both outputs. The three names used for
+dead-letter metadata (`source_row`, `validation_codes`, and `validation_messages`)
+are reserved. Invalid rows may carry multiple reason codes. Time-only values are
+interpreted as one UTC day, as specified by the challenge; they are never compared
+with dated RFC3339 values. Rows with mixed representations are quarantined with
+`MIXED_TIMESTAMP_FORMAT`.
 Schema or CSV syntax failures stop the run because row boundaries cannot be trusted;
 data-quality failures are quarantined and do not stop other rows.
 
 The implementation uses O(n) validation and de-duplication plus O(n log n) sorting
-for deterministic chain-time output. It writes each result through a temporary file
-and atomic rename so a failed write cannot leave a partially written artifact.
+for deterministic chain-time output. A run writes all three artifacts to a fresh
+generation directory before updating `LATEST`. Consumers should read `LATEST` once
+per load and read every artifact from that directory; a failed run leaves the prior
+generation selected. Individual files and the pointer are replaced with
+`os.Rename`. On Unix, a same-filesystem rename gives atomic visibility, but
+[Go does not guarantee atomicity on every platform](https://pkg.go.dev/os#Rename).
 
 ## Run the pipeline
 
@@ -70,11 +85,19 @@ go run .
 ```
 
 There are no third-party dependencies. The default command reads `sample_feed.csv`
-and writes:
+and writes `output/LATEST`, which contains the relative path of the latest complete
+run directory, such as `runs/run-123456789`. That directory contains:
 
-- `output/valid_trades.csv`: records safe for the analytics load;
-- `output/rejected_events.csv`: dead-letter records with reason codes and messages;
-- `output/validation_report.json`: counts and structured issue details.
+- `valid_trades.csv`: records safe for the analytics load;
+- `rejected_events.csv`: dead-letter records with reason codes and messages;
+- `validation_report.json`: counts and structured issue details.
+
+For example, read `output/LATEST` once and use that same directory for all files:
+
+```bash
+run_dir="output/$(cat output/LATEST)"
+ls "$run_dir"
+```
 
 To validate another feed or choose another destination:
 

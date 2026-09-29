@@ -15,7 +15,13 @@ const (
 	validOutputName    = "valid_trades.csv"
 	rejectedOutputName = "rejected_events.csv"
 	reportOutputName   = "validation_report.json"
+	latestOutputName   = "LATEST"
 )
+
+type outputFile struct {
+	name  string
+	write func(io.Writer) error
+}
 
 type validationSummary struct {
 	InputRows    int               `json:"input_rows"`
@@ -44,35 +50,63 @@ func runPipeline(inputPath, outputDir string) (ValidationResult, error) {
 		return ValidationResult{}, fmt.Errorf("close input feed: %w", closeErr)
 	}
 
-	if err := os.MkdirAll(outputDir, 0o755); err != nil {
-		return ValidationResult{}, fmt.Errorf("create output directory: %w", err)
-	}
-
-	outputs := []struct {
-		name  string
-		write func(io.Writer) error
-	}{
+	outputs := []outputFile{
 		{validOutputName, func(writer io.Writer) error { return writeValidEvents(writer, result) }},
 		{rejectedOutputName, func(writer io.Writer) error { return writeRejectedEvents(writer, result) }},
 		{reportOutputName, func(writer io.Writer) error { return writeReport(writer, result) }},
 	}
+	runDir, err := publishOutputs(outputDir, outputs)
+	if err != nil {
+		return ValidationResult{}, err
+	}
+	result.RunDir = runDir
+	return result, nil
+}
+
+func publishOutputs(outputDir string, outputs []outputFile) (string, error) {
+	runsDir := filepath.Join(outputDir, "runs")
+	if err := os.MkdirAll(runsDir, 0o755); err != nil {
+		return "", fmt.Errorf("create output directory: %w", err)
+	}
+
+	runDir, err := os.MkdirTemp(runsDir, "run-")
+	if err != nil {
+		return "", fmt.Errorf("create output run: %w", err)
+	}
+	published := false
+	defer func() {
+		if !published {
+			_ = os.RemoveAll(runDir)
+		}
+	}()
+
 	for _, output := range outputs {
-		path := filepath.Join(outputDir, output.name)
+		path := filepath.Join(runDir, output.name)
 		if err := writeAtomically(path, output.write); err != nil {
-			return ValidationResult{}, fmt.Errorf("write %s: %w", output.name, err)
+			return "", fmt.Errorf("write %s: %w", output.name, err)
 		}
 	}
 
-	return result, nil
+	latestPath := filepath.Join(outputDir, latestOutputName)
+	runPath := filepath.Join("runs", filepath.Base(runDir))
+	if err := writeAtomically(latestPath, func(writer io.Writer) error {
+		_, err := io.WriteString(writer, runPath+"\n")
+		return err
+	}); err != nil {
+		return "", fmt.Errorf("publish output run: %w", err)
+	}
+
+	published = true
+	return runDir, nil
 }
 
 func writeValidEvents(destination io.Writer, result ValidationResult) error {
 	writer := csv.NewWriter(destination)
-	if err := writer.Write(csvFields); err != nil {
+	if err := writer.Write(result.Columns); err != nil {
 		return err
 	}
 	for _, event := range result.Accepted {
-		if err := writer.Write(recordFromRow(event.Raw, csvFields)); err != nil {
+		if err := writer.Write(recordFromRow(event.Raw, result.Columns)); err != nil {
 			return err
 		}
 	}
@@ -81,7 +115,7 @@ func writeValidEvents(destination io.Writer, result ValidationResult) error {
 }
 
 func writeRejectedEvents(destination io.Writer, result ValidationResult) error {
-	fields := append([]string(nil), csvFields...)
+	fields := append([]string(nil), result.Columns...)
 	fields = append(fields, "source_row", "validation_codes", "validation_messages")
 	writer := csv.NewWriter(destination)
 	if err := writer.Write(fields); err != nil {
@@ -96,7 +130,7 @@ func writeRejectedEvents(destination io.Writer, result ValidationResult) error {
 			messages = append(messages, issue.Message)
 		}
 
-		record := recordFromRow(event.Raw, csvFields)
+		record := recordFromRow(event.Raw, result.Columns)
 		record = append(
 			record,
 			fmt.Sprintf("%d", event.SourceRow),
