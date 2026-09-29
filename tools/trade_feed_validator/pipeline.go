@@ -116,7 +116,7 @@ func writeValidEvents(destination io.Writer, result ValidationResult) error {
 
 func writeRejectedEvents(destination io.Writer, result ValidationResult) error {
 	fields := append([]string(nil), result.Columns...)
-	fields = append(fields, "source_row", "validation_codes", "validation_messages")
+	fields = append(fields, "source_row", "validation_codes", "validation_messages", "unmapped_values_json")
 	writer := csv.NewWriter(destination)
 	if err := writer.Write(fields); err != nil {
 		return err
@@ -129,6 +129,14 @@ func writeRejectedEvents(destination io.Writer, result ValidationResult) error {
 			codes = append(codes, string(issue.Code))
 			messages = append(messages, issue.Message)
 		}
+		unmappedValues := ""
+		if len(event.UnmappedValues) > 0 {
+			encoded, err := json.Marshal(event.UnmappedValues)
+			if err != nil {
+				return err
+			}
+			unmappedValues = string(encoded)
+		}
 
 		record := recordFromRow(event.Raw, result.Columns)
 		record = append(
@@ -136,6 +144,7 @@ func writeRejectedEvents(destination io.Writer, result ValidationResult) error {
 			fmt.Sprintf("%d", event.SourceRow),
 			strings.Join(codes, "|"),
 			strings.Join(messages, "|"),
+			unmappedValues,
 		)
 		if err := writer.Write(record); err != nil {
 			return err

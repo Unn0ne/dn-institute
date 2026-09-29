@@ -62,10 +62,11 @@ type TradeEvent struct {
 }
 
 type RejectedEvent struct {
-	EventID   string
-	SourceRow int
-	Raw       map[string]string
-	Issues    []ValidationIssue
+	EventID        string
+	SourceRow      int
+	Raw            map[string]string
+	UnmappedValues []string
+	Issues         []ValidationIssue
 }
 
 type ValidationResult struct {
@@ -101,6 +102,7 @@ func (r ValidationResult) IssueCounts() map[IssueCode]int {
 
 type inputRow struct {
 	values           map[string]string
+	unmappedValues   []string
 	sourceRow        int
 	malformedMessage string
 }
@@ -147,7 +149,8 @@ func validateCSV(reader io.Reader) (ValidationResult, error) {
 		if _, exists := headerIndex[name]; exists {
 			return ValidationResult{}, fmt.Errorf("feed schema: duplicate CSV column %q", name)
 		}
-		if name == "source_row" || name == "validation_codes" || name == "validation_messages" {
+		if name == "source_row" || name == "validation_codes" ||
+			name == "validation_messages" || name == "unmapped_values_json" {
 			return ValidationResult{}, fmt.Errorf("feed schema: reserved output column %q", name)
 		}
 		header[index] = name
@@ -191,6 +194,9 @@ func validateCSV(reader io.Reader) (ValidationResult, error) {
 		}
 
 		row := inputRow{values: values, sourceRow: sourceRow}
+		if len(record) > len(header) {
+			row.unmappedValues = append([]string(nil), record[len(header):]...)
+		}
 		if len(record) != len(header) {
 			row.malformedMessage = fmt.Sprintf(
 				"row has %d value(s), but the CSV header defines %d",
@@ -364,10 +370,11 @@ func validateInputRows(rows []inputRow, columns []string) ValidationResult {
 
 		if len(issues) > 0 {
 			result.Rejected = append(result.Rejected, RejectedEvent{
-				EventID:   displayID,
-				SourceRow: incoming.sourceRow,
-				Raw:       raw,
-				Issues:    issues,
+				EventID:        displayID,
+				SourceRow:      incoming.sourceRow,
+				Raw:            raw,
+				UnmappedValues: incoming.unmappedValues,
+				Issues:         issues,
 			})
 			continue
 		}

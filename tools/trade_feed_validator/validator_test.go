@@ -597,6 +597,7 @@ func TestCSVSchemaAndSyntaxFailures(t *testing.T) {
 		{name: "duplicate column", content: "event_id,event_id\na,b\n", want: "duplicate CSV column"},
 		{name: "empty column", content: "event_id,\na,b\n", want: "header column 2 is empty"},
 		{name: "reserved column", content: "event_id,tx_hash,block_time,wallet,side,amount,ingested_at,validation_codes\n", want: "reserved output column"},
+		{name: "reserved unmapped values column", content: "event_id,tx_hash,block_time,wallet,side,amount,ingested_at,unmapped_values_json\n", want: "reserved output column"},
 		{name: "invalid CSV", content: "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n\"unterminated", want: "read CSV record"},
 	}
 
@@ -684,7 +685,7 @@ func TestCSVReportsPhysicalSourceLineAfterBlankLine(t *testing.T) {
 
 func TestMalformedCSVRowsAreQuarantined(t *testing.T) {
 	header := "event_id,tx_hash,block_time,wallet,side,amount,ingested_at\n"
-	feed := header + "evt_1,0x1,10:00:00,0xwallet,BUY,1,10:00:01,unexpected\n"
+	feed := header + `evt_1,0x1,10:00:00,0xwallet,BUY,1,10:00:01,"extra,one","quoted ""value"""` + "\n"
 	result, err := validateCSV(strings.NewReader(feed))
 	if err != nil {
 		t.Fatalf("validateCSV() error = %v", err)
@@ -693,6 +694,29 @@ func TestMalformedCSVRowsAreQuarantined(t *testing.T) {
 		t.Fatalf("accepted/rejected = %d/%d, want 0/1", len(result.Accepted), len(result.Rejected))
 	}
 	assertOnlyIssue(t, result.Rejected[0], MalformedRow)
+	wantExtras := []string{"extra,one", `quoted "value"`}
+	if !reflect.DeepEqual(result.Rejected[0].UnmappedValues, wantExtras) {
+		t.Fatalf("unmapped values = %v, want %v", result.Rejected[0].UnmappedValues, wantExtras)
+	}
+
+	var output bytes.Buffer
+	if err := writeRejectedEvents(&output, result); err != nil {
+		t.Fatalf("write rejected events: %v", err)
+	}
+	records, err := csv.NewReader(&output).ReadAll()
+	if err != nil {
+		t.Fatalf("read rejected output: %v", err)
+	}
+	if got := records[0][len(records[0])-1]; got != "unmapped_values_json" {
+		t.Fatalf("last output column = %q, want unmapped_values_json", got)
+	}
+	var gotExtras []string
+	if err := json.Unmarshal([]byte(records[1][len(records[1])-1]), &gotExtras); err != nil {
+		t.Fatalf("decode unmapped values: %v", err)
+	}
+	if !reflect.DeepEqual(gotExtras, wantExtras) {
+		t.Fatalf("output unmapped values = %v, want %v", gotExtras, wantExtras)
+	}
 }
 
 func TestShortCSVRowIsQuarantinedWithAllReasons(t *testing.T) {

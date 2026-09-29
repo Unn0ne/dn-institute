@@ -58,9 +58,11 @@ The validator checks:
 
 Amounts use `math/big.Rat`, not `float64`, so large or fractional decimal values are
 compared without rounding. Header order does not matter, a UTF-8 BOM is supported,
-and extra named columns are preserved in both outputs. The three names used for
-dead-letter metadata (`source_row`, `validation_codes`, and `validation_messages`)
-are reserved. Invalid rows may carry multiple reason codes. Time-only values are
+and extra named columns are preserved in both outputs. The four names used for
+dead-letter metadata (`source_row`, `validation_codes`, `validation_messages`, and
+`unmapped_values_json`) are reserved. Over-wide malformed rows keep values beyond
+the header as a JSON array in `unmapped_values_json`; the field is blank otherwise.
+Invalid rows may carry multiple reason codes. Time-only values are
 interpreted as one UTC day, as specified by the challenge; they are never compared
 with dated RFC3339 values. Rows with mixed representations are quarantined with
 `MIXED_TIMESTAMP_FORMAT`.
@@ -92,7 +94,8 @@ and writes `output/LATEST`, which contains the relative path of the latest compl
 run directory, such as `runs/run-123456789`. That directory contains:
 
 - `valid_trades.csv`: records safe for the analytics load;
-- `rejected_events.csv`: dead-letter records with reason codes and messages;
+- `rejected_events.csv`: dead-letter records with reason codes, messages, and
+  any values beyond the declared header;
 - `validation_report.json`: counts and structured issue details.
 
 For example, read `output/LATEST` once and use that same directory for all files:
